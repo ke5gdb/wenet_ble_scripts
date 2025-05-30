@@ -88,9 +88,9 @@ async def connect_device(connection_cnt):
             await connection_lock.acquire()
             async with BleakClient(device, timeout=10, disconnected_callback=disconnected) as client:
                 print(f"Connected to {device}")
+                connection_lock.release()
                 await client.start_notify(WENET_SENSOR_CHAR, notify_handler)
                 while True:
-                    connection_lock.release()
                     await event.wait()
                     # Debug
                     if(client.is_connected):
