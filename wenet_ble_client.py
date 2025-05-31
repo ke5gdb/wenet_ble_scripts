@@ -141,7 +141,7 @@ async def main(args: argparse.Namespace):
         tasks.append(asyncio.create_task(connect_device(connection_cnt)))
     tasks.append(asyncio.create_task(scanner(connection_cnt)))
     tasks.append(asyncio.create_task(process_json(args.timeout)))
-    tasks.append(asyncio.create_task(udp.run_client(json_queue, 8888)))
+    tasks.append(asyncio.create_task(udp.run_client(json_queue, 55674)))
     await asyncio.gather(*(tasks))
 
 if __name__ == "__main__":
