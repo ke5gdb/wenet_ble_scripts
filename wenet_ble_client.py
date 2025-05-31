@@ -29,9 +29,10 @@ def process_single_packet(data: bytearray):
     header = data[0:3]
     payload = data[3:].ljust(16, b'\xff')
     cur_time = datetime.datetime.now(datetime.timezone.utc)
-    cur_time = cur_time.hour * 3600 + cur_time.minute * 60 + (cur_time.microsecond // 1000)
-    cur_time = struct.pack('<I', cur_time)
-    return header + cur_time + payload
+    calc_time = (cur_time.hour * 3600) + (cur_time.minute * 60) + cur_time.second
+    calc_time = (calc_time * 1000) + (cur_time.microsecond // 1000)
+    calc_time = struct.pack('<I', calc_time)
+    return header + calc_time + payload
 
 def decode_packet(data: bytearray):
     header = '<BH'
