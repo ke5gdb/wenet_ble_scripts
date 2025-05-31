@@ -21,6 +21,6 @@ The RPi 3 and RPi Zero only have two uarts, the second (miniuart) being much wea
 
 Add to config.txt in bootfs
 ```
-dtoverlay=disable-bt
+dtoverlay=miniuart-bt
 core_freq=250
 ```
