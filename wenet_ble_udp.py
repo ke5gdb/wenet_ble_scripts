@@ -29,7 +29,7 @@ class UDPClientProtocol(asyncio.DatagramProtocol):
             
     def connection_lost(self, exc):
         self.on_con_lost.set_result(True)
-        logging.error("UDP connection closed")
+        logging.info("UDP connection closed")
 
 async def run_client(queue, port):
     loop = asyncio.get_event_loop()
