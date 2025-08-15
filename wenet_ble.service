@@ -3,14 +3,12 @@ Description=wenet_ble
 After=wenet_tx.service
 
 [Service]
-# Update this path if the wenet files are not in the pi user's home directory!
-ExecStart=/home/pi/wenet_ble_client/start_ble_client.sh
+ExecStart=/home/pi/wenet_ble_scripts/start_ble.sh
 Restart=always
 RestartSec=30
 # This one too!
-WorkingDirectory=/home/pi/wenet_ble_client/
+WorkingDirectory=/home/pi/wenet_ble_scripts/
 
-# NOTE - Wenet unfortunately needs to be run at root, else we can't easily set the system time.
 #User=pi
 SyslogIdentifier=wenet_ble
 
