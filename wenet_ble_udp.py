@@ -1,5 +1,6 @@
 import sys
 import asyncio
+import logging
 
 class UDPClientProtocol(asyncio.DatagramProtocol):
     def __init__(self, on_con_lost):
@@ -8,32 +9,32 @@ class UDPClientProtocol(asyncio.DatagramProtocol):
 
     def connection_made(self, transport):
         self.transport = transport
-        print('UDP connection established')
+        logging.info('UDP connection established')
 
     def error_received(self, exc):
-        print('Error received:', exc)
+        logging.error('Error received:', exc)
 
     def send_packet(self, data):
         if self.transport is not None:
             self.transport.sendto(data)
         else:
-            print("Transport is not available")
+            logging.error("Transport is not available")
 
     def close_conn(self):
         if self.transport is not None:
-            print("Closing UDP connection")
+            logging.info("Closing UDP connection")
             self.transport.close()
         else:
-            print("Transport is not available")
+            logging.error("Transport is not available")
             
     def connection_lost(self, exc):
         self.on_con_lost.set_result(True)
-        print("UDP connection closed")
+        logging.error("UDP connection closed")
 
 async def run_client(queue, port):
     loop = asyncio.get_event_loop()
     on_con_lost = loop.create_future()
-    print("Starting UDP client")
+    logging.info("Starting UDP client")
     transport, protocol = await loop.create_datagram_endpoint(
         lambda: UDPClientProtocol(on_con_lost),
         remote_addr=('127.0.0.1', port)
