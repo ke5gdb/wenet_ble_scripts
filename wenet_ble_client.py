@@ -23,6 +23,8 @@ WENET_SENSOR_CHAR = "3d235f0e-61f8-4455-89c6-2f7d73c33178"
 packet_queue = asyncio.Queue(50)
 # Queue for JSON packets to send to the UDP server
 json_queue = asyncio.Queue(50)
+# Queue for data to be written to a local file
+file_queue = asyncio.Queue(50)
 # Queue for devices found by the scanner
 device_queue = asyncio.Queue(50)
 # Lock for when a connection is being made
@@ -64,8 +66,8 @@ async def scanner(connection_cnt):
             logging.info("Scanner started...")
             try:
                 async for (device, adv_data) in scanner.advertisement_data():
-                    # if(adv_data.rssi < -100):
-                    #     continue
+                    if(adv_data.rssi < -120):
+                        continue
                     if(WENET_SERVICE_UUID in adv_data.service_uuids or WENET_SERVICE_UUID_SHORT in adv_data.service_uuids):
                         logging.info(f"Found {device}, rssi: {adv_data.rssi}")
                         device_queue.put_nowait(device)
@@ -112,7 +114,7 @@ async def connect_device(connection_cnt):
 
 async def process_json(timeout):
     message_count = 0
-    
+
     while True:
         payload = bytearray()
         try:
@@ -137,10 +139,19 @@ async def process_json(timeout):
         json_frame = json.dumps({'type': 'WENET_TX_SEC_PAYLOAD', 'id': 55, 'repeats': 1, 'packet': list(binary_payload)})
         json_queue.put_nowait(json_frame.encode())
 
+        file_queue.put_nowait(payload)
+
         logging.info(f"Adding packet to queue from {name} ({address}): {payload}")
 
         message_count = (message_count + 1) % 65536
-        
+
+async def write_file():
+    with open("ble_data.log", "ab") as f:
+        while True:
+            data = await file_queue.get() + b"\n"
+            f.write(data)
+            f.flush()
+
 async def main(args: argparse.Namespace):
     connection_cnt = asyncio.Semaphore(args.device_count)
     tasks = []
@@ -148,6 +159,7 @@ async def main(args: argparse.Namespace):
         tasks.append(asyncio.create_task(connect_device(connection_cnt)))
     tasks.append(asyncio.create_task(scanner(connection_cnt)))
     tasks.append(asyncio.create_task(process_json(args.timeout)))
+    tasks.append(asyncio.create_task(write_file()))
     tasks.append(asyncio.create_task(udp.run_client(json_queue, 55674)))
     await asyncio.gather(*(tasks))
 
