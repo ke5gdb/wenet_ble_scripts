@@ -4,7 +4,7 @@ Scripts for recieving BLE sensor data and forwarding to a Wenet Telemetry UDP li
 ### First time setup
 Clone, create a python virutal enviroment, and install requirements.txt
 ```
-git clone https://github.com/BobbyCounts/wenet_ble_scripts.git
+git clone https://github.com/ke5gdb/wenet_ble_scripts.git
 cd wenet_ble_scripts
 python3 -m venv .venv
 source .venv/bin/activate
