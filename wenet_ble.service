@@ -1,0 +1,23 @@
+[Unit]
+Description=Wenet BLE sensor client
+Documentation=https://github.com/ke5gdb/wenet_ble_scripts
+After=bluetooth.service network.target
+Wants=bluetooth.service
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+SupplementaryGroups=bluetooth
+WorkingDirectory=/home/pi/wenet_ble_scripts
+ExecStart=/usr/bin/python3 /home/pi/wenet_ble_scripts/wenet_ble_client.py
+# Unbuffered so log lines reach the journal as they happen
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wenet_ble
+
+[Install]
+WantedBy=multi-user.target

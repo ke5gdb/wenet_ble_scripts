@@ -30,7 +30,7 @@ logger.info("Sensor data log: %s", _log_filename)
 WENET_SERVICE_UUID = "fb63feb8-31ad-451d-a587-9fc20f9c8add"
 WENET_SENSOR_CHAR  = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # NUS TX
 
-TX_SENTINEL            = '/tmp/sstv_tx'
+TX_SENTINEL            = '/tmp/sstv_tx' # do not scan while SSTV is transmitting via Bluetooth to prevent choppy audio
 MAX_CONNECTIONS        = 10
 MAX_RECONNECT_ATTEMPTS = 10
 SCAN_PAUSE_S           = 1.0
