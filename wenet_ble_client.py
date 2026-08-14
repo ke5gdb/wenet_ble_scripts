@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 from datetime import datetime, timezone
 import cbor2
 import wenet_ble_udp as udp
@@ -35,6 +36,7 @@ MAX_CONNECTIONS        = 10
 MAX_RECONNECT_ATTEMPTS = 10
 SCAN_PAUSE_S           = 1.0
 RETRY_DELAY_S          = 2.0
+SHUTDOWN_TIMEOUT_S     = 10.0
 UDP_PAYLOAD_LEN        = 254
 
 # Replace each packet's 'time' with this host's clock before forwarding. Sensor payloads
@@ -229,7 +231,62 @@ async def process_packets():
             logger.warning("JSON queue full — frame dropped")
 
 
+async def release_stale_links():
+    """Drops Wenet links bluetoothd is still holding on our behalf from a previous run.
+
+    The BLE link lives in the controller and in bluetoothd, not in this process. If we
+    died without unwinding the BleakClient context — SIGKILL, an unhandled crash, a
+    stopped service — the ACL stays up and bluetoothd keeps it alive. The sensor firmware
+    advertises only while disconnected, so that half-dead link makes the sensor invisible
+    to scanner() forever: it never re-advertises, we never see it, and the payload goes
+    quiet until someone runs `bluetoothctl disconnect` by hand. Dropping the link here
+    lets the sensor start advertising again within a supervision timeout.
+
+    Only devices exposing the Wenet service UUID are touched. The payload's Bluetooth
+    audio link carries SSTV and must survive this.
+    """
+    try:
+        from dbus_fast import BusType
+        from dbus_fast.aio import MessageBus
+    except ImportError:
+        logger.warning(
+            "dbus_fast unavailable — cannot check for stale links. If a sensor never "
+            "appears in the scan, disconnect it manually with `bluetoothctl disconnect`."
+        )
+        return
+
+    bus = None
+    try:
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        root = bus.get_proxy_object("org.bluez", "/", await bus.introspect("org.bluez", "/"))
+        manager = root.get_interface("org.freedesktop.DBus.ObjectManager")
+
+        for path, interfaces in (await manager.call_get_managed_objects()).items():
+            props = interfaces.get("org.bluez.Device1")
+            if props is None:
+                continue
+            if not props["Connected"].value:
+                continue
+            uuids = [u.lower() for u in props["UUIDs"].value] if "UUIDs" in props else []
+            if WENET_SERVICE_UUID not in uuids:
+                continue
+
+            address = props["Address"].value
+            logger.warning("Stale link to %s from a previous run — disconnecting", address)
+            device = bus.get_proxy_object("org.bluez", path, await bus.introspect("org.bluez", path))
+            await device.get_interface("org.bluez.Device1").call_disconnect()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.warning("Could not check for stale links: %s", e)
+    finally:
+        if bus is not None:
+            bus.disconnect()
+
+
 async def main(args: argparse.Namespace):
+    await release_stale_links()
+
     tasks = [
         asyncio.create_task(scanner(), name="scanner"),
         *[
@@ -239,12 +296,39 @@ async def main(args: argparse.Namespace):
         asyncio.create_task(process_packets(),    name="process_packets"),
         asyncio.create_task(udp.run_client(json_queue, 55674), name="udp"),
     ]
+
+    # SIGTERM is how systemd stops us, and its default disposition kills the process
+    # outright — no context managers unwound, so every BleakClient link is left open for
+    # the next run to trip over (see release_stale_links). Catching it turns a stop into
+    # an ordinary cancellation, which does run the disconnects.
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except (NotImplementedError, AttributeError):
+            pass  # non-POSIX; KeyboardInterrupt still covers SIGINT
+    stop_task = asyncio.create_task(stop.wait(), name="stop")
+
     try:
-        await asyncio.gather(*tasks)
+        done, _ = await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
+        if stop_task in done:
+            logger.info("Stop requested — disconnecting")
+        for t in done:
+            if t is not stop_task and not t.cancelled() and t.exception() is not None:
+                logger.error("Task %s failed: %s", t.get_name(), t.exception())
     finally:
-        for t in tasks:
+        for t in (*tasks, stop_task):
             t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # Bounded: the disconnects run during this wait, but a wedged one must not hold
+        # the service open until systemd's stop timeout fires and SIGKILLs us.
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, stop_task, return_exceptions=True), timeout=SHUTDOWN_TIMEOUT_S
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Shutdown timed out after %.0fs — links may be left open",
+                           SHUTDOWN_TIMEOUT_S)
         logger.info("Shutdown complete")
 
 

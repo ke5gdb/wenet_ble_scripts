@@ -15,6 +15,9 @@ ExecStart=/usr/bin/python3 /home/pi/ble_bridge/wenet_ble_client.py
 Environment=PYTHONUNBUFFERED=1
 Restart=always
 RestartSec=5
+# SIGTERM is handled so BLE links get disconnected on the way out -- a link left open
+# stops the sensor advertising, and the next run cannot find it. Allow time for that.
+TimeoutStopSec=20
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=wenet_ble
