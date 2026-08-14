@@ -3,7 +3,7 @@ import asyncio
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 import cbor2
 import wenet_ble_udp as udp
 
@@ -37,30 +37,95 @@ SCAN_PAUSE_S           = 1.0
 RETRY_DELAY_S          = 2.0
 UDP_PAYLOAD_LEN        = 254
 
+# Replace each packet's 'time' with this host's clock before forwarding. Sensor payloads
+# without a working RTC report wildly wrong times; disable with --no-rewrite-time to
+# downlink exactly what was received.
+rewrite_time = True
+
 packet_queue: asyncio.Queue[bytearray] = asyncio.Queue(100)
 json_queue:   asyncio.Queue[bytes]     = asyncio.Queue(50)
 device_queue: asyncio.Queue            = asyncio.Queue(MAX_CONNECTIONS * 2)
 managed_addresses: set[str]            = set()
 
 
-def _log_sensor_data(data: bytearray) -> None:
+def _packet_timestamp(received_at: datetime) -> str:
+    """Host time in the same ISO 8601 basic format the sensor firmware emits."""
+    return f"{received_at.strftime('%Y%m%dT%H%M%S')}.{received_at.microsecond // 1000:03d}Z"
+
+
+def _log_sensor_data(decoded: dict, received_at: datetime) -> None:
+    # Leading column is the host clock, not the payload's — sensor RTCs are often unset
+    # or wrong. The payload's own 'time' still rides along as a key/value pair, so drift
+    # stays visible instead of being silently discarded.
+    time_str = received_at.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    parts = [time_str, str(decoded['count']), str(decoded['id'])]
+    for key, value in decoded.items():
+        if key in ('count', 'id'):
+            continue
+        parts += [key, f"{value:.3f}" if isinstance(value, float) else str(value)]
+    _data_logger.info(','.join(parts))
+
+
+def _apply_host_time(decoded: dict, received_at: datetime, original: bytes) -> bytes:
+    """Swaps the packet's 'time' for the host's, falling back to the original packet.
+
+    The timestamp is patched directly into the encoded bytes rather than re-encoding the
+    map. The firmware packs floats as CBOR single-precision, while CPython's cbor2 emits
+    doubles — a full re-encode would silently add 4 bytes per float and push real packets
+    past the 254-byte frame. Patching in place leaves every other byte untouched.
+    """
+    original_time = decoded.get('time')
+    if not isinstance(original_time, str):
+        logger.warning("Packet from %s has no string 'time' — forwarding as-is",
+                       decoded.get('id'))
+        return original
+
+    expected = {**decoded, 'time': _packet_timestamp(received_at)}
     try:
-        decoded = cbor2.loads(data)
-        time_str = datetime.fromisoformat(decoded['time']).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        parts = [time_str, str(decoded['count']), str(decoded['id'])]
-        for key, value in decoded.items():
-            if key in ('time', 'count', 'id'):
-                continue
-            parts += [key, f"{value:.3f}" if isinstance(value, float) else str(value)]
-        _data_logger.info(','.join(parts))
+        old_encoded = cbor2.dumps(original_time)
+        new_encoded = cbor2.dumps(expected['time'])
+        if len(old_encoded) == len(new_encoded) and original.count(old_encoded) == 1:
+            patched = original.replace(old_encoded, new_encoded, 1)
+            # Cheap guard against a coincidental byte match elsewhere in the packet.
+            if cbor2.loads(patched) == expected:
+                return patched
+
+        # Timestamp length changed, or the patch didn't verify — fall back to a full
+        # re-encode and only use it if it still fits the frame.
+        reencoded = cbor2.dumps(expected)
+        if len(reencoded) <= UDP_PAYLOAD_LEN:
+            return reencoded
+        logger.warning(
+            "Re-encoded packet is %d bytes (limit %d) — forwarding original",
+            len(reencoded), UDP_PAYLOAD_LEN,
+        )
     except Exception as e:
-        logger.warning("Could not decode sensor data: %s", e)
+        logger.warning("Could not apply host time: %s", e)
+    return original
 
 
 def notify_handler(characteristic: BleakGATTCharacteristic, data: bytearray):
-    _log_sensor_data(data)
+    received_at = datetime.now(timezone.utc)
+    payload = bytes(data)
+
     try:
-        packet_queue.put_nowait(bytearray(data))
+        decoded = cbor2.loads(data)
+    except Exception as e:
+        logger.warning("Could not decode sensor data: %s", e)
+        decoded = None
+
+    # A packet we can't parse is still worth downlinking — log the failure and forward
+    # it untouched rather than losing telemetry to our own decoder.
+    if isinstance(decoded, dict):
+        try:
+            _log_sensor_data(decoded, received_at)
+        except Exception as e:
+            logger.warning("Could not log sensor data: %s", e)
+        if rewrite_time:
+            payload = _apply_host_time(decoded, received_at, payload)
+
+    try:
+        packet_queue.put_nowait(bytearray(payload))
     except asyncio.QueueFull:
         logger.warning("Packet queue full — packet dropped")
 
@@ -184,8 +249,24 @@ async def main(args: argparse.Namespace):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Bridges Wenet BLE sensor payloads to the Wenet telemetry UDP listener.",
+    )
+    parser.add_argument(
+        "--no-rewrite-time",
+        dest="rewrite_time",
+        action="store_false",
+        help="Downlink packets exactly as received instead of replacing each packet's "
+             "'time' field with this host's UTC clock (default: rewrite).",
+    )
     args = parser.parse_args()
+
+    rewrite_time = args.rewrite_time
+    logger.info(
+        "Downlink timestamps: %s",
+        "host UTC clock" if rewrite_time else "payload RTC (unmodified)",
+    )
+
     try:
         asyncio.run(main(args))
     except KeyboardInterrupt:

@@ -21,7 +21,7 @@ python3 wenet_ble_client.py
 ```
 
 ## Running as a service
-`wenet_ble.service` starts the client at boot and restarts it if it exits. It assumes the repo is at `/home/pi/ble_bridge` and runs as the `pi` user — edit `User`, `Group`, `WorkingDirectory`, and `ExecStart` in the unit file if your setup differs.
+`wenet_ble.service` starts the client at boot and restarts it if it exits. It assumes the repo is at `/home/pi/ble_bridge` and runs as the `pi` user — edit `User`, `Group`, `WorkingDirectory`, and `ExecStart` in the unit file if your setup differs. Command-line flags such as `--no-rewrite-time` go on the end of `ExecStart`.
 
 ```
 sudo cp ~/ble_bridge/wenet_ble.service /etc/systemd/system/
@@ -94,4 +94,15 @@ Everything else is conditional on I2C/OneWire probing at boot, and a field is si
 | Honeywell HSC | `hsc_temp`, `hsc_pres` |
 | DS18x20 (OneWire) | `temp-<addr>`, one per probe, where `<addr>` is the last two bytes of the ROM ID in hex |
 
-Consumers should treat the field set as open: decode the map, pull `time`/`id`/`count`, and iterate the rest rather than assuming a fixed schema. That is what [wenet_ble_client.py](wenet_ble_client.py#L46-L57) does when writing the CSV log.
+Consumers should treat the field set as open: decode the map, pull `id`/`count`, and iterate the rest rather than assuming a fixed schema. That is what [wenet_ble_client.py](wenet_ble_client.py#L46-L58) does when writing the CSV log.
+
+#### Timestamps
+
+Sensor payloads without a PCF8523 (or with a dead backup cell) come up with an unset RTC, so their `time` field can be years off. This bridge uses its own clock instead, in both directions:
+
+- **CSV log** — written as `<host time>,<count>,<id>,<key>,<value>,...`. The leading column is the host system clock at the moment the packet arrived. The payload's own `time` is preserved as a regular key/value pair, so RTC drift stays visible and diagnosable rather than being silently discarded.
+- **Downlink** — each packet's `time` is replaced with the host's UTC clock before the packet is framed for RF, in the same `20260726T130405.123Z` format the firmware uses. Pass `--no-rewrite-time` to downlink packets exactly as received.
+
+The rewrite patches the timestamp directly into the encoded CBOR rather than re-encoding the map. This matters: the firmware packs floats as CBOR single-precision, while CPython's `cbor2` emits doubles, so a naive re-encode silently adds 4 bytes per float — about +32 bytes on a typical `_ENV` packet, which would eventually push a well-populated payload past the 254-byte frame. Patching in place leaves every other byte identical and keeps the packet exactly the same size.
+
+Packets that fail to decode, or that carry no usable `time`, are forwarded untouched rather than dropped — a decoder problem on this end should never cost telemetry.
