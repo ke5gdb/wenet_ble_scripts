@@ -78,3 +78,17 @@ Sensor payloads without a PCF8523 (or with a dead backup cell) come up with an u
 The rewrite patches the timestamp directly into the encoded CBOR rather than re-encoding the map. This matters: the firmware packs floats as CBOR single-precision, while CPython's `cbor2` emits doubles, so a naive re-encode silently adds 4 bytes per float — about +32 bytes on a typical `_ENV` packet, which would eventually push a well-populated payload past the 254-byte frame. Patching in place leaves every other byte identical and keeps the packet exactly the same size.
 
 Packets that fail to decode, or that carry no usable `time`, are forwarded untouched rather than dropped — a decoder problem on this end should never cost telemetry.
+
+### Restarts and stale links
+
+The BLE link lives in the Bluetooth controller and in `bluetoothd`, not in this process, and a sensor advertises only while it is *disconnected*. That combination means a link left open by a dead client is self-perpetuating: the sensor still believes it is connected, so it stops advertising, so nothing here can ever find it again.
+
+Two things guard against that. `SIGTERM` — how `systemctl stop`/`restart` ends the service — is handled, so a normal stop disconnects every sensor on the way out. For the cases where no handler can run (`SIGKILL`, a hard crash, an OOM kill), startup asks BlueZ for any device that is still connected *and* advertising the Wenet service UUID, and disconnects it before scanning. Only Wenet sensors are touched; a Bluetooth audio link carrying SSTV is left alone.
+
+If a sensor still never appears in the scan, check whether the link is stuck and drop it by hand:
+```
+bluetoothctl devices Connected
+sudo hcitool con
+bluetoothctl disconnect <MAC>
+```
+The sensor should start advertising again within a supervision timeout, and the next scan pass will pick it up.

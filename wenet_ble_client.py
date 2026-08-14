@@ -31,6 +31,9 @@ logger.info("Sensor data log: %s", _log_filename)
 WENET_SERVICE_UUID = "fb63feb8-31ad-451d-a587-9fc20f9c8add"
 WENET_SENSOR_CHAR  = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # NUS TX
 
+BLUEZ_SERVICE    = "org.bluez"
+DEVICE_INTERFACE = "org.bluez.Device1"
+
 TX_SENTINEL            = '/tmp/sstv_tx' # do not scan while SSTV is transmitting via Bluetooth to prevent choppy audio
 MAX_CONNECTIONS        = 10
 MAX_RECONNECT_ATTEMPTS = 10
@@ -245,40 +248,56 @@ async def release_stale_links():
     Only devices exposing the Wenet service UUID are touched. The payload's Bluetooth
     audio link carries SSTV and must survive this.
     """
+    # Linux-only, and only reachable at all because bleak pulls dbus_fast in on this
+    # platform. Anywhere else there is no BlueZ to clean up after.
     try:
-        from dbus_fast import BusType
+        from dbus_fast import BusType, Message, MessageType, unpack_variants
         from dbus_fast.aio import MessageBus
     except ImportError:
-        logger.warning(
-            "dbus_fast unavailable — cannot check for stale links. If a sensor never "
-            "appears in the scan, disconnect it manually with `bluetoothctl disconnect`."
-        )
+        logger.info("dbus_fast unavailable — skipping stale link check")
         return
+
+    def _checked(reply, what):
+        if reply is None or reply.message_type is MessageType.ERROR:
+            raise RuntimeError(f"{what} failed: {getattr(reply, 'body', ['no reply'])[0]}")
+        return reply
 
     bus = None
     try:
         bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-        root = bus.get_proxy_object("org.bluez", "/", await bus.introspect("org.bluez", "/"))
-        manager = root.get_interface("org.freedesktop.DBus.ObjectManager")
+        # Raw messages rather than proxy objects, the way bleak's own BlueZ backend does
+        # it — no introspection round trip needed just to read properties.
+        reply = _checked(await bus.call(Message(
+            destination=BLUEZ_SERVICE,
+            path="/",
+            interface="org.freedesktop.DBus.ObjectManager",
+            member="GetManagedObjects",
+        )), "GetManagedObjects")
 
-        for path, interfaces in (await manager.call_get_managed_objects()).items():
-            props = interfaces.get("org.bluez.Device1")
-            if props is None:
+        for path, interfaces in reply.body[0].items():
+            props = unpack_variants(interfaces.get(DEVICE_INTERFACE, {}))
+            if not props.get("Connected"):
                 continue
-            if not props["Connected"].value:
-                continue
-            uuids = [u.lower() for u in props["UUIDs"].value] if "UUIDs" in props else []
-            if WENET_SERVICE_UUID not in uuids:
+            # Filter on the Wenet UUID: the payload's Bluetooth audio link carries SSTV
+            # and must survive this.
+            if WENET_SERVICE_UUID not in [u.lower() for u in props.get("UUIDs", [])]:
                 continue
 
-            address = props["Address"].value
+            address = props.get("Address", path)
             logger.warning("Stale link to %s from a previous run — disconnecting", address)
-            device = bus.get_proxy_object("org.bluez", path, await bus.introspect("org.bluez", path))
-            await device.get_interface("org.bluez.Device1").call_disconnect()
+            _checked(await bus.call(Message(
+                destination=BLUEZ_SERVICE,
+                path=path,
+                interface=DEVICE_INTERFACE,
+                member="Disconnect",
+            )), f"Disconnect {address}")
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        logger.warning("Could not check for stale links: %s", e)
+        logger.warning(
+            "Stale link check failed (%s) — if a sensor never appears in the scan, "
+            "disconnect it manually with `bluetoothctl disconnect`", e,
+        )
     finally:
         if bus is not None:
             bus.disconnect()
