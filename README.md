@@ -14,6 +14,8 @@ git clone https://github.com/ke5gdb/wenet_payload_ble_bridge.git ~/ble_bridge
 sudo rfkill unblock bluetooth
 ```
 
+**NOTE**: The version of `bleak` available in Pi OS **Bookworm** is not compatible. The newer versions available in Trixie or `pip` are required. If you are attempting to install this on a Bookworm instance, it is recommended to install the packages in a venv using `pip install bleak cbor2`. The service file will need to be appropriately updated to use the Python binary from the venv.
+
 ### Run
 ```
 cd ~/ble_bridge
@@ -64,37 +66,7 @@ A sensor payload runs one task per sensor group, and each task emits its own pac
 | `id` | string | `<payload_name>_<task_name>`, e.g. `RAB_HAT_ENV`. `payload_name` defaults to `RAB_HAT` and is set per-payload via `config.json` (max 32 bytes). The BLE advertised name is this truncated to 8 bytes, so it will not always match. |
 | `count` | int | Per-task packet counter, wrapping at 65536. |
 
-**`_ENV` task** — always runs, default every 500 ms. Adds these regardless of what sensors are attached:
-
-| Field | Type | Description |
-| --- | --- | --- |
-| `v_in` | float | Input/battery voltage in volts, from ADC3 through the on-board 3:1 divider. |
-| `pi_temp` | int | Pico core temperature in °C, from the RP2040/RP2350 internal diode on ADC4. Truncated to a whole degree, and only good to a few °C — it is a die sensor, not an ambient one. |
-| `adc0`, `adc1`, `adc2` | int | Raw 12-bit readings (0–4095) from the three exposed ADC pins. Unscaled — apply whatever conversion your analog front end needs. |
-
-**`_LSM6DSOX` task** — only runs if an LSM6DSOX IMU is detected, but then always sends all of:
-
-| Field | Type | Description |
-| --- | --- | --- |
-| `a_x`, `a_y`, `a_z` | float | Accelerometer, m/s². |
-| `g_x`, `g_y`, `g_z` | float | Gyroscope, deg/s. |
-| `imu_temp` | float | IMU die temperature in °C. |
-| `fall_cnt` | int | Running count of free-fall events flagged by the LSM6DSOX since boot. |
-
-Everything else is conditional on I2C/OneWire probing at boot, and a field is simply absent if its sensor is missing or errored on that read. All of these ride in the `_ENV` packet:
-
-| Sensor | Fields |
-| --- | --- |
-| LIS3MDL magnetometer | `mag_x`, `mag_y`, `mag_z` |
-| BMP280 | `bmp_temp`, `bmp_pres` |
-| BME280 | `bme280_temp`, `bme280_pres`, `bme280_humi` |
-| BME680 | `bme_temp`, `bme_pres`, `bme_humi` |
-| HDC302x | `hdc_temp`, `hdc_humi` |
-| MAX31725 | `max31725_temp` |
-| Honeywell HSC | `hsc_temp`, `hsc_pres` |
-| DS18x20 (OneWire) | `temp-<addr>`, one per probe, where `<addr>` is the last two bytes of the ROM ID in hex |
-
-Consumers should treat the field set as open: decode the map, pull `id`/`count`, and iterate the rest rather than assuming a fixed schema. That is what [wenet_ble_client.py](wenet_ble_client.py#L46-L58) does when writing the CSV log.
+Consumers should treat the field set as open: decode the map, pull `time`/`id`/`count`, and iterate the rest rather than assuming a fixed schema. That is what [wenet_ble_client.py](wenet_ble_client.py#L46-L57) does when writing the CSV log.
 
 #### Timestamps
 
