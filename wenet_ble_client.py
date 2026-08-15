@@ -40,7 +40,11 @@ MAX_RECONNECT_ATTEMPTS = 10
 SCAN_PAUSE_S           = 1.0
 RETRY_DELAY_S          = 2.0
 SHUTDOWN_TIMEOUT_S     = 10.0
-UDP_PAYLOAD_LEN        = 254
+# A 0x05 CBOR payload frame is [0x05][length][CBOR], carried in a fixed 256-byte Wenet
+# frame, so the CBOR itself can be at most 254 bytes. This is a ceiling, not a fixed
+# size: the length byte tells the receiver the true extent, so short packets go out
+# short instead of being padded and having the filler ride along to the archive.
+MAX_PAYLOAD_LEN        = 254
 
 # Replace each packet's 'time' with this host's clock before forwarding. Sensor payloads
 # without a working RTC report wildly wrong times; disable with --no-rewrite-time to
@@ -77,7 +81,7 @@ def _apply_host_time(decoded: dict, received_at: datetime, original: bytes) -> b
     The timestamp is patched directly into the encoded bytes rather than re-encoding the
     map. The firmware packs floats as CBOR single-precision, while CPython's cbor2 emits
     doubles — a full re-encode would silently add 4 bytes per float and push real packets
-    past the 254-byte frame. Patching in place leaves every other byte untouched.
+    past the frame limit. Patching in place leaves every other byte untouched.
     """
     original_time = decoded.get('time')
     if not isinstance(original_time, str):
@@ -98,11 +102,11 @@ def _apply_host_time(decoded: dict, received_at: datetime, original: bytes) -> b
         # Timestamp length changed, or the patch didn't verify — fall back to a full
         # re-encode and only use it if it still fits the frame.
         reencoded = cbor2.dumps(expected)
-        if len(reencoded) <= UDP_PAYLOAD_LEN:
+        if len(reencoded) <= MAX_PAYLOAD_LEN:
             return reencoded
         logger.warning(
             "Re-encoded packet is %d bytes (limit %d) — forwarding original",
-            len(reencoded), UDP_PAYLOAD_LEN,
+            len(reencoded), MAX_PAYLOAD_LEN,
         )
     except Exception as e:
         logger.warning("Could not apply host time: %s", e)
@@ -215,18 +219,22 @@ async def connect_device():
 
 
 async def process_packets():
-    """Forwards each sensor packet as its own 254-byte UDP frame (matches wenet_modem scheme)."""
+    """Forwards each sensor packet as its own WENET_TX_CBOR_PAYLOAD UDP frame.
+
+    The 0x05 frame carries an explicit length byte, so the CBOR travels at its true size
+    and the receiver recovers exactly the bytes the sensor emitted. The older 0x03
+    secondary-payload frame had no length field, which meant padding every packet out to
+    a fixed 254 bytes and carrying that filler through the whole chain into the archive.
+    """
     while True:
         data = await packet_queue.get()
-        if len(data) > UDP_PAYLOAD_LEN:
+        if len(data) > MAX_PAYLOAD_LEN:
             logger.error("Packet too long (%d bytes) — discarding", len(data))
             continue
-        padded = bytes(data).ljust(UDP_PAYLOAD_LEN, b'\x00')
         frame = json.dumps({
-            'type':    'WENET_TX_SEC_PAYLOAD',
-            'id':      55,
+            'type':    'WENET_TX_CBOR_PAYLOAD',
             'repeats': 1,
-            'packet':  list(padded),
+            'packet':  list(data),
         })
         try:
             json_queue.put_nowait(frame.encode())
