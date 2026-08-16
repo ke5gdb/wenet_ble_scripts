@@ -31,14 +31,19 @@ logger.info("Sensor data log: %s", _log_filename)
 WENET_SERVICE_UUID = "fb63feb8-31ad-451d-a587-9fc20f9c8add"
 WENET_SENSOR_CHAR  = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # NUS TX
 
-BLUEZ_SERVICE    = "org.bluez"
-DEVICE_INTERFACE = "org.bluez.Device1"
+BLUEZ_SERVICE     = "org.bluez"
+DEVICE_INTERFACE  = "org.bluez.Device1"
+ADAPTER_INTERFACE = "org.bluez.Adapter1"
 
 TX_SENTINEL            = '/tmp/sstv_tx' # do not scan while SSTV is transmitting via Bluetooth to prevent choppy audio
 MAX_CONNECTIONS        = 10
-MAX_RECONNECT_ATTEMPTS = 10
 SCAN_PAUSE_S           = 1.0
+CONNECT_TIMEOUT_S      = 10.0
 RETRY_DELAY_S          = 2.0
+MAX_RETRY_DELAY_S      = 30.0
+# Purge the BlueZ cache entry after this many failures; a stale one that lost its LE
+# address type sends BlueZ down the BR/EDR path -> br-connection-canceled.
+FORGET_AFTER_FAILURES  = 3
 SHUTDOWN_TIMEOUT_S     = 10.0
 # A 0x05 CBOR payload frame is [0x05][length][CBOR], carried in a fixed 256-byte Wenet
 # frame, so the CBOR itself can be at most 254 bytes. This is a ceiling, not a fixed
@@ -54,7 +59,10 @@ rewrite_time = True
 packet_queue: asyncio.Queue[bytearray] = asyncio.Queue(100)
 json_queue:   asyncio.Queue[bytes]     = asyncio.Queue(50)
 device_queue: asyncio.Queue            = asyncio.Queue(MAX_CONNECTIONS * 2)
+# Reserved at enqueue, not at pickup, so the scanner cannot hand the same device to two workers.
 managed_addresses: set[str]            = set()
+failure_counts: dict[str, int]         = {}
+retry_after:    dict[str, float]       = {}  # address -> loop.time() before which not to retry
 
 
 def _packet_timestamp(received_at: datetime) -> str:
@@ -148,7 +156,14 @@ async def _wait_while_tx() -> None:
 
 
 async def scanner():
-    """Scans for Wenet sensors and enqueues unmanaged devices, one per pass."""
+    """Scans for Wenet sensors and enqueues unmanaged devices, one per pass.
+
+    This is the only source of BLEDevice objects. A failed connection releases the address
+    back here rather than retrying in place: BlueZ purges temporary devices once discovery
+    stops, so a held BLEDevice goes stale, and the sensor advertises only while
+    disconnected — a fresh advertisement is the one reliable signal it can be connected to.
+    """
+    loop = asyncio.get_running_loop()
     while True:
         await _wait_while_tx()
         try:
@@ -164,9 +179,12 @@ async def scanner():
                         continue
                     if device.address in managed_addresses:
                         continue
+                    if loop.time() < retry_after.get(device.address, 0.0):
+                        continue  # backing off after a failed connection
                     logger.info("Found %s (RSSI %d)", device, adv_data.rssi)
                     try:
                         device_queue.put_nowait(device)
+                        managed_addresses.add(device.address)
                     except asyncio.QueueFull:
                         pass
                     break  # one device per pass; restart after pause
@@ -177,45 +195,77 @@ async def scanner():
         await asyncio.sleep(SCAN_PAUSE_S)
 
 
+async def forget_device(device) -> None:
+    """Drops the device's BlueZ cache entry so the next advertisement rebuilds it clean."""
+    details = device.details if isinstance(device.details, dict) else {}
+    path    = details.get("path")
+    if not path:
+        return  # not the BlueZ backend
+    try:
+        from dbus_fast import BusType, Message, MessageType
+        from dbus_fast.aio import MessageBus
+    except ImportError:
+        return
+
+    bus = None
+    try:
+        bus   = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        reply = await bus.call(Message(
+            destination=BLUEZ_SERVICE,
+            path=path.rsplit("/", 1)[0],  # the adapter owns RemoveDevice, not the device
+            interface=ADAPTER_INTERFACE,
+            member="RemoveDevice",
+            signature="o",
+            body=[path],
+        ))
+        if reply is None or reply.message_type is MessageType.ERROR:
+            raise RuntimeError(getattr(reply, 'body', ['no reply'])[0])
+        logger.info("Dropped BlueZ cache entry for %s", device.address)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.warning("Could not drop BlueZ cache entry for %s: %s", device.address, e)
+    finally:
+        if bus is not None:
+            bus.disconnect()
+
+
 async def connect_device():
-    """Owns the connection lifecycle for one device, retrying on disconnect or error."""
+    """Holds one device's link for as long as it lasts, then releases it back to scanner()."""
     loop = asyncio.get_running_loop()
     while True:
         device = await device_queue.get()
         addr   = device.address
-        managed_addresses.add(addr)
-        logger.info("Managing %s", addr)
 
-        failures = 0
-        while failures < MAX_RECONNECT_ATTEMPTS:
-            disconnect_event = asyncio.Event()
+        disconnect_event = asyncio.Event()
 
-            def on_disconnect(client, _ev=disconnect_event):
-                loop.call_soon_threadsafe(_ev.set)
+        def on_disconnect(client, _ev=disconnect_event):
+            loop.call_soon_threadsafe(_ev.set)
 
-            logger.info("Connecting to %s", addr)
-            try:
-                async with BleakClient(device, timeout=10, disconnected_callback=on_disconnect) as client:
-                    logger.info("Connected to %s", addr)
-                    await client.start_notify(WENET_SENSOR_CHAR, notify_handler)
-                    failures = 0
-                    await disconnect_event.wait()
-                    logger.info("Disconnected from %s", addr)
-            except asyncio.CancelledError:
-                managed_addresses.discard(addr)
-                raise
-            except Exception as e:
-                failures += 1
-                logger.error(
-                    "Connection error for %s (%d/%d): %s",
-                    addr, failures, MAX_RECONNECT_ATTEMPTS, e,
-                )
-
-            if failures < MAX_RECONNECT_ATTEMPTS:
-                await asyncio.sleep(RETRY_DELAY_S)
-
-        logger.warning("Giving up on %s after %d consecutive failures", addr, failures)
-        managed_addresses.discard(addr)
+        logger.info("Connecting to %s", addr)
+        try:
+            async with BleakClient(device, timeout=CONNECT_TIMEOUT_S,
+                                   disconnected_callback=on_disconnect) as client:
+                logger.info("Connected to %s", addr)
+                await client.start_notify(WENET_SENSOR_CHAR, notify_handler)
+                failure_counts.pop(addr, None)
+                retry_after.pop(addr, None)
+                await disconnect_event.wait()
+                logger.info("Disconnected from %s", addr)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            failures = failure_counts.get(addr, 0) + 1
+            failure_counts[addr] = failures
+            # Exponent capped as well as the delay — failures are unbounded over a flight.
+            delay = min(RETRY_DELAY_S * 2 ** min(failures - 1, 10), MAX_RETRY_DELAY_S)
+            retry_after[addr] = loop.time() + delay
+            logger.error("Connection error for %s (attempt %d, waiting %.0fs): %s",
+                         addr, failures, delay, e)
+            if failures % FORGET_AFTER_FAILURES == 0:
+                await forget_device(device)
+        finally:
+            managed_addresses.discard(addr)
 
 
 async def process_packets():
